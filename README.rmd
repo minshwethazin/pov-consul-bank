@@ -1,0 +1,459 @@
+Retail Banking Demo on AWS
+
+A three-service lab using Nicholas Jackson’s fake-service, version v0.26.2. Each service runs on an EC2 instance in its own VPC. An internet-facing Application Load Balancer (ALB) exposes the Customer Profile service; that service calls Account, which calls Statement.
+
+The lab demonstrated HTTP 200 responses across all three services through the ALB and the custom domain. This README records the configuration and commands used, with placeholders for reusable AWS resource names.
+
+Architecture
+
+flowchart TD
+
+    Browser["Browser · HTTPS 443"] --> ALB["Customer ALB · TLS termination"]
+
+    subgraph Customer["Customer VPC · 10.10.0.0/16"]
+
+        ALB --> C["Customer Profile · 10.10.3.170:9091"]
+
+    end
+
+    subgraph Account["Account VPC · 10.20.0.0/16"]
+
+        A["Account · 10.20.1.141:9092"]
+
+    end
+
+    subgraph Statement["Statement VPC · 10.30.0.0/16"]
+
+        S["Statement · 10.30.1.130:9093"]
+
+    end
+
+    C -->|"HTTP · VPC peering"| A
+
+    A -->|"HTTP · VPC peering"| S
+
+Route 53 resolves the custom domain to the ALB. TLS terminates at the ALB; the ALB-to-EC2 and service-to-service connections in this demo use HTTP. HTTPS at the public entry point does not imply end-to-end TLS or application authentication.
+
+Lab addressing
+
+These private IPs are the values used in this lab. Substitute the private IPs assigned to your instances when reproducing it.
+
+|Service         |VPC CIDR      |Private subnet|Private IP   |Port  |
+|----------------|--------------|--------------|-------------|------|
+|Customer Profile|`10.10.0.0/16`|`10.10.3.0/24`|`10.10.3.170`|`9091`|
+|Account         |`10.20.0.0/16`|`10.20.1.0/24`|`10.20.1.141`|`9092`|
+|Statement       |`10.30.0.0/16`|`10.30.1.0/24`|`10.30.1.130`|`9093`|
+
+Region: Asia Pacific (Tokyo), ap-northeast-1.
+
+1. Run locally with Docker Compose
+
+Save the following as compose.yaml:
+
+name: retail-banking-fake-service
+
+services:
+
+  customer-profile-svc:
+
+    image: nicholasjackson/fake-service:v0.26.2
+
+    ports:
+
+      - "8081:9091"
+
+    environment:
+
+      LISTEN_ADDR: "0.0.0.0:9091"
+
+      NAME: "customer-profile-svc"
+
+      MESSAGE: "HelloCloudBank | Retail Banking | customer-profile-svc"
+
+      UPSTREAM_URIS: "http://account-svc:9092"
+
+  account-svc:
+
+    image: nicholasjackson/fake-service:v0.26.2
+
+    environment:
+
+      LISTEN_ADDR: "0.0.0.0:9092"
+
+      NAME: "account-svc"
+
+      MESSAGE: "HelloCloudBank | Retail Banking | account-svc"
+
+      UPSTREAM_URIS: "http://statement-svc:9093"
+
+  statement-svc:
+
+    image: nicholasjackson/fake-service:v0.26.2
+
+    environment:
+
+      LISTEN_ADDR: "0.0.0.0:9093"
+
+      NAME: "statement-svc"
+
+      MESSAGE: "HelloCloudBank | Retail Banking | statement-svc"
+
+docker compose up -d
+
+docker compose ps
+
+curl --max-time 10 http://localhost:8081/
+
+docker compose logs --tail=50
+
+Open http://localhost:8081/ui/ to view the service flow. Compose provides service-name DNS on its default network. 0.0.0.0 is a listening address; upstream requests use service names.
+
+Stop the local demo:
+
+docker compose down
+
+2. Create the AWS network
+
+Create the three VPCs and private subnets listed above. Enable DNS resolution and DNS hostnames. In the Customer VPC, also create:
+
+	●	Public subnet A: 10.10.1.0/24.
+	●	Public subnet B: 10.10.2.0/24, in a different Availability Zone.
+	●	An Internet Gateway attached to the Customer VPC.
+	●	A public NAT Gateway with an Elastic IP in a Customer public subnet.
+
+Create and accept these VPC peering connections; both must become Active:
+
+|Peering connection         |VPCs               |
+|---------------------------|-------------------|
+|`customer-account-peering` |Customer ↔ Account |
+|`account-statement-peering`|Account ↔ Statement|
+
+Route tables
+
+Associate each route table explicitly with its intended subnet(s). The two public subnets can share one public route table.
+
+|Route table           |Destination   |Target                   |
+|----------------------|--------------|-------------------------|
+|`customer-public-rt`  |`10.10.0.0/16`|local                    |
+|`customer-public-rt`  |`0.0.0.0/0`   |Customer Internet Gateway|
+|`customer-private-rt` |`10.10.0.0/16`|local                    |
+|`customer-private-rt` |`0.0.0.0/0`   |Customer NAT Gateway     |
+|`customer-private-rt` |`10.20.0.0/16`|Customer–Account peering |
+|`account-private-rt`  |`10.20.0.0/16`|local                    |
+|`account-private-rt`  |`10.10.0.0/16`|Customer–Account peering |
+|`account-private-rt`  |`10.30.0.0/16`|Account–Statement peering|
+|`statement-private-rt`|`10.30.0.0/16`|local                    |
+|`statement-private-rt`|`10.20.0.0/16`|Account–Statement peering|
+
+VPC peering is not transitive. Customer does not connect directly to Statement: Account receives one request and makes a separate request to Statement. Account and Statement also cannot use Customer’s NAT Gateway through peering.
+
+3. Configure security groups
+
+Create each security group in the VPC containing the resource it protects.
+
+|Security group             |VPC      |Inbound rule   |Source                                       |
+|---------------------------|---------|---------------|---------------------------------------------|
+|`customer-alb-sg`          |Customer |TCP `80`, `443`|Your public IP `/32`, or approved client CIDR|
+|`customer-ec2-sg`          |Customer |TCP `9091`     |`customer-alb-sg`                            |
+|`account-ec2-sg`           |Account  |TCP `9092`     |`customer-ec2-sg`                            |
+|`statement-ec2-sg`         |Statement|TCP `9093`     |`account-ec2-sg`                             |
+|`account-ssm-endpoint-sg`  |Account  |TCP `443`      |`account-ec2-sg`                             |
+|`statement-ssm-endpoint-sg`|Statement|TCP `443`      |`statement-ec2-sg`                           |
+
+The lab uses the default allow all outbound rule. No inbound SSH rule is required for Session Manager. Keep default network ACLs for this setup; custom ACLs must also permit return traffic.
+
+For a security group in an actively peered VPC in the same Region, enter its actual sg-... ID as the source. A group from the other VPC may not appear in the dropdown. Typing only its name is not a valid security group reference.
+
+4. IAM, private access, and EC2
+
+Create an EC2-trusted IAM role named retail-banking-ec2-role and attach AmazonSSMManagedInstanceCore.
+
+Create these Interface endpoints in each of Account and Statement VPCs:
+
+	●	com.amazonaws.ap-northeast-1.ssm
+	●	com.amazonaws.ap-northeast-1.ssmmessages
+
+Select the corresponding private subnet, enable Private DNS, and attach that VPC’s endpoint security group. Use the default Full Access endpoint policy for this lab. This setup uses a modern SSM Agent; older agent versions can have additional endpoint requirements.
+
+Create an S3 Gateway endpoint (com.amazonaws.ap-northeast-1.s3) in each backend VPC and associate it with its private route table. The endpoint adds an S3 prefix-list route automatically. Customer uses its NAT Gateway for outbound AWS access.
+
+Launch one EC2 instance per service:
+
+|Setting             |Value                                     |
+|--------------------|------------------------------------------|
+|AMI                 |Amazon Linux 2023, x86_64                 |
+|Instance type       |`t3.micro`                                |
+|Storage             |8 GiB                                     |
+|Subnet              |Corresponding service’s private subnet    |
+|Public IP           |Disabled                                  |
+|Security group      |Corresponding service’s EC2 security group|
+|IAM instance profile|`retail-banking-ec2-role`                 |
+|Connection method   |SSM Session Manager                       |
+
+Wait for instance checks to pass and the SSM Agent to report Online, then connect using Session Manager.
+
+hostname
+
+uname -m
+
+hostname -I
+
+The architecture must report x86_64 for the Linux AMD64 binary used below.
+
+5. Download and distribute the binary
+
+On the Mac
+
+mkdir -p ~/fake-service-linux
+
+curl -fL \
+
+  https://github.com/nicholasjackson/fake-service/releases/download/v0.26.2/fake_service_linux_amd64.zip \
+
+  -o ~/fake-service-linux/fake_service_linux_amd64.zip
+
+unzip ~/fake-service-linux/fake_service_linux_amd64.zip -d ~/fake-service-linux
+
+file ~/fake-service-linux/fake-service
+
+Expected file type: an ELF 64-bit Linux x86-64 executable. The Linux binary is for EC2; it cannot run natively on macOS.
+
+Create a private S3 bucket in Tokyo with Block Public Access enabled. In the S3 console, upload the extracted fake-service file to the bucket root. The EC2 commands below download the executable directly, so no EC2 unzip step is needed.
+
+Allow the EC2 role to read the object
+
+Add an inline policy to retail-banking-ec2-role. Replace YOUR_BINARY_BUCKET with your bucket name:
+
+{
+
+  "Version": "2012-10-17",
+
+  "Statement": [
+
+    {
+
+      "Effect": "Allow",
+
+      "Action": "s3:GetObject",
+
+      "Resource": "arn:aws:s3:::YOUR_BINARY_BUCKET/fake-service"
+
+    }
+
+  ]
+
+}
+
+On each EC2 instance
+
+Set the bucket variable to your real bucket name in each Session Manager shell:
+
+export BINARY_BUCKET="YOUR_BINARY_BUCKET"
+
+mkdir -p ~/fake-service
+
+cd ~/fake-service
+
+aws s3 cp "s3://${BINARY_BUCKET}/fake-service" ./fake-service \
+
+  --region ap-northeast-1
+
+chmod +x ./fake-service
+
+ls -lh ./fake-service
+
+6. Start the services
+
+Start in dependency order: Statement → Account → Customer Profile. Replace upstream IPs if your instances have different addresses. Run each start command once on the named instance; starting a second copy on the same port fails.
+
+Statement EC2
+
+cd ~/fake-service
+
+nohup env \
+
+  LISTEN_ADDR="0.0.0.0:9093" \
+
+  NAME="statement-svc" \
+
+  MESSAGE="HelloCloudBank | Retail Banking | statement-svc" \
+
+  ./fake-service > statement.log 2>&1 &
+
+curl --max-time 10 http://localhost:9093/
+
+Account EC2
+
+First verify Account can reach Statement:
+
+curl --connect-timeout 5 --max-time 10 http://10.30.1.130:9093/
+
+Then start Account:
+
+cd ~/fake-service
+
+nohup env \
+
+  LISTEN_ADDR="0.0.0.0:9092" \
+
+  NAME="account-svc" \
+
+  MESSAGE="HelloCloudBank | Retail Banking | account-svc" \
+
+  UPSTREAM_URIS="http://10.30.1.130:9093" \
+
+  ./fake-service > account.log 2>&1 &
+
+curl --max-time 10 http://localhost:9092/
+
+The response should contain Account and a nested Statement response, both with code: 200.
+
+Customer Profile EC2
+
+First verify Customer can reach Account:
+
+curl --connect-timeout 5 --max-time 10 http://10.20.1.141:9092/
+
+Then start Customer Profile:
+
+cd ~/fake-service
+
+nohup env \
+
+  LISTEN_ADDR="0.0.0.0:9091" \
+
+  NAME="customer-profile-svc" \
+
+  MESSAGE="HelloCloudBank | Retail Banking | customer-profile-svc" \
+
+  UPSTREAM_URIS="http://10.20.1.141:9092" \
+
+  ./fake-service > customer.log 2>&1 &
+
+curl --max-time 10 http://localhost:9091/
+
+The response should contain all three services with code: 200. nohup allows the process to continue after leaving the shell; it does not configure startup after an EC2 reboot. A persistent deployment should use a service manager such as systemd.
+
+7. Create the target group and ALB
+
+Target group: customer-tg
+
+|Setting          |Value                                           |
+|-----------------|------------------------------------------------|
+|Target type      |Instances                                       |
+|Protocol / port  |HTTP / `9091`                                   |
+|VPC              |Customer VPC                                    |
+|Protocol version |HTTP1                                           |
+|Health check     |HTTP, traffic port, path `/`, success code `200`|
+|Registered target|Customer Profile EC2 on port `9091`             |
+
+Application Load Balancer: customer-alb
+
+|Setting         |Value                                        |
+|----------------|---------------------------------------------|
+|Scheme          |Internet-facing                              |
+|IP address type |IPv4                                         |
+|VPC             |Customer VPC                                 |
+|Subnets         |Both Customer public subnets in different AZs|
+|Security group  |`customer-alb-sg`                            |
+|Initial listener|HTTP `80` → forward to `customer-tg`         |
+
+Ensure the Customer instance’s Availability Zone is enabled on the ALB. Wait for the ALB to become Active and the target to become Healthy.
+
+From an allowed client, test the ALB DNS name:
+
+export ALB_DNS_NAME="YOUR_ALB_DNS_NAME"
+
+curl --max-time 10 "http://${ALB_DNS_NAME}/"
+
+Open http://YOUR_ALB_DNS_NAME/ui/ for the visual flow. An Unused target with None associated before creating the ALB listener is expected: the target group has not yet been attached to a listener.
+
+8. Custom domain and HTTPS
+
+The lab domain is bank.hellogeolab.site. Use a domain you control when reproducing the setup.
+
+	1.	Ensure the domain’s authoritative nameservers delegate to the Route 53 public hosted zone you are editing.
+	2.	Create an A Alias record for bank, pointing to the Customer ALB in Tokyo.
+	3.	In ACM in Tokyo, request a public certificate for the exact hostname, using DNS validation. Export is not required for an ALB-managed certificate.
+	4.	Create ACM’s validation CNAME in the authoritative DNS zone. Keep it for renewal and wait for the certificate status to become Issued.
+	5.	Add an ALB HTTPS 443 listener, select the issued certificate and a recommended TLS policy, and forward to customer-tg.
+	6.	Verify customer-alb-sg allows inbound 443 from your intended clients.
+	7.	Change the HTTP 80 listener’s default action to Redirect to HTTPS:
+
+|Redirect field|Value     |
+|--------------|----------|
+|Protocol      |HTTPS     |
+|Port          |`443`     |
+|Host          |`#{host}` |
+|Path          |`/#{path}`|
+|Query         |`#{query}`|
+|Status code   |HTTP `301`|
+
+Test from an allowed client:
+
+export DEMO_HOST="bank.hellogeolab.site"
+
+curl -I --max-time 10 "http://${DEMO_HOST}/ui/"
+
+curl --max-time 10 "https://${DEMO_HOST}/"
+
+Expected: the first command returns a 301 redirect to HTTPS; the second returns the three-service JSON response. Open https://bank.hellogeolab.site/ui/ to view the flow over HTTPS. Do not use curl -k to validate the certificate.
+
+Troubleshooting
+
+|Symptom                                       |Checks                                                                                                                                                                                                 |
+|----------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|S3 download returns `403 HeadObject Forbidden`|Confirm the exact object key is `fake-service`, not only the ZIP. Check EC2 role `s3:GetObject`, bucket policy and endpoint policy. A missing key can return 403 when the caller lacks `s3:ListBucket`.|
+|SSM Agent offline or connection timeout       |Check attached IAM role, endpoint status, Private DNS, VPC DNS settings, endpoint SG inbound 443 and instance outbound 443. Customer also needs a working NAT route.                                   |
+|Resource map shows `Network Connections (0)`  |Use the Peering Connections page to verify Active status and inspect the actual subnet route tables. The resource-map count alone does not establish peering connectivity.                             |
+|Cross-VPC SG missing from dropdown            |Enter the correct `sg-...` ID; verify same Region and Active peering.                                                                                                                                  |
+|Local service responds but upstream times out |Check the remote process and port, both directions of peering routes, actual subnet associations, SG rules and any custom ACLs.                                                                        |
+|Target remains Unused                         |Attach its target group to an ALB listener and enable the target’s AZ.                                                                                                                                 |
+|ALB target is Unhealthy                       |Check service listening on `0.0.0.0:9091`, target port, health path `/`, and EC2 inbound 9091 from the ALB SG.                                                                                         |
+|Browser shows Not Secure                      |Open the custom hostname with `https://`; confirm ACM certificate matches the hostname and is attached to the HTTPS listener.                                                                          |
+|Access works only from one computer           |The ALB SG may allow only your public IP `/32`. Authorize the intended client’s CIDR if access is required.                                                                                            |
+|Service stops after reboot                    |`nohup` does not restart services. Configure a service manager if reboot persistence is needed.                                                                                                        |
+
+Useful commands on the relevant EC2 instance:
+
+pgrep -af fake-service
+
+ss -lntp
+
+tail -n 50 ~/fake-service/statement.log
+
+# On Account instead:
+
+tail -n 50 ~/fake-service/account.log
+
+# On Customer instead:
+
+tail -n 50 ~/fake-service/customer.log
+
+Validation checklist
+
+		Both peering connections are Active.
+		Private subnet route tables have the correct peer routes and associations.
+		All three instances connect through Session Manager.
+		Statement responds locally on 9093.
+		Account responds locally on 9092 with Statement’s nested 200 response.
+		Customer responds locally on 9091 with all three 200 responses.
+		Customer ALB target is Healthy.
+		Custom-domain HTTPS validates successfully.
+		HTTP redirects to HTTPS while preserving the path and query.
+		/ui/ displays Customer Profile → Account → Statement.
+
+
+References
+
+	●	fake-service repository
+	●	fake-service v0.26.2 release
+	●	VPC peering basics
+	●	VPC peering routes
+	●	Systems Manager VPC endpoints
+	●	S3 Gateway endpoints
+	●	S3 HeadObject permissions and errors
+	●	Route 53 routing to an ALB
+	●	ACM DNS validation
+	●	ALB HTTPS listeners
+	●	ALB redirect actions

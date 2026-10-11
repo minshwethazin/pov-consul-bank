@@ -1,0 +1,78 @@
+#!/bin/bash
+set -euo pipefail
+
+# AL2023 includes AWS CLI v2 and SSM Agent. Backend instances have no NAT;
+# bootstrap intentionally uses no yum/dnf, GitHub downloads or SSH.
+command -v aws
+id fake-service >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin fake-service
+install -d -m 0755 /etc/fake-service /usr/local/sbin
+
+cat > /etc/fake-service/service.env <<'ENV'
+LISTEN_ADDR=0.0.0.0:${listen_port}
+NAME=${service_name}
+MESSAGE="HelloCloudBank | Retail Banking | ${service_name}"
+UPSTREAM_URIS=${upstream_uri}
+ENV
+chmod 0644 /etc/fake-service/service.env
+
+cat > /usr/local/sbin/fake-service-fetch <<'FETCH'
+#!/bin/bash
+set -euo pipefail
+export AWS_DEFAULT_REGION='${region}'
+export AWS_MAX_ATTEMPTS=3
+export AWS_RETRY_MODE=standard
+export AWS_PAGER=""
+
+# Skip a download on reboot if the installed executable matches this deployment.
+if [[ -x /usr/local/bin/fake-service ]] &&
+   echo '${binary_sha256}  /usr/local/bin/fake-service' | sha256sum --check --status; then
+  exit 0
+fi
+
+download_file=$(mktemp)
+trap 'rm -f "$download_file"' EXIT
+for attempt in $(seq 1 8); do
+  if aws --cli-connect-timeout 10 --cli-read-timeout 30 s3 cp \
+      's3://${binary_bucket}/${binary_key}' "$download_file" --only-show-errors; then
+    echo "${binary_sha256}  $download_file" | sha256sum --check --status
+    install -m 0755 -o root -g root "$download_file" /usr/local/bin/fake-service
+    exit 0
+  fi
+  echo "Binary fetch attempt $attempt failed; retrying in 10 seconds" >&2
+  sleep 10
+done
+exit 1
+FETCH
+chmod 0755 /usr/local/sbin/fake-service-fetch
+
+cat > /etc/systemd/system/fake-service.service <<'UNIT'
+[Unit]
+Description=Retail banking ${service_name}
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=fake-service
+Group=fake-service
+EnvironmentFile=/etc/fake-service/service.env
+# The + prefix runs only the fetch/install step as root.
+ExecStartPre=+/usr/local/sbin/fake-service-fetch
+ExecStart=/usr/local/bin/fake-service
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=180
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now amazon-ssm-agent
+# Do not block cloud-init waiting for retries or eventual IAM propagation.
+systemctl enable fake-service
+systemctl start --no-block fake-service
